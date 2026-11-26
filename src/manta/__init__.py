@@ -4,5 +4,6 @@ from . import (
     embedding,
     plot,
     preprocessing,
+    reconstruction,
     sampling
 )
