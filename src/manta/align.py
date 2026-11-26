@@ -1,1 +1,1 @@
-from .api._alignment import rigid, non_rigid, register, MantaResult
+from .api._alignment import rigid, rigid_joint, non_rigid, register, MantaResult

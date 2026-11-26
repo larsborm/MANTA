@@ -11,6 +11,11 @@ from ..old.alignment._rigid import (
     _apply_transform,
     _ransac
 )
+from ..matching._joint_rigid import (
+    _scan_features,
+    _rotation_scan,
+    _ot_refine
+)
 from ..old.alignment._non_rigid import (
     _match,
     _ProbabilisticRegistration
@@ -171,6 +176,106 @@ def rigid(
         progress=progress, 
         message="Finished"
     )
+
+
+def rigid_joint(
+    source: ad.AnnData,
+    target: ad.AnnData,
+    angles: Optional[List[float]] = None,
+    scan_pixel_size: float = 5.0,
+    scan_sigma: float = 10.0,
+    n_scan_features: int = 10,
+    refine: bool = True,
+    sigmas: Tuple[float, ...] = (40, 25, 15, 10, 6),
+    alpha: float = 3.0,
+    epsilon: float = 0.05,
+    rho: float = 0.5,
+    n_inner: int = 3,
+    n_sinkhorn_iters: int = 30,
+    max_points: int = 1500,
+    allow_scaling: bool = False,
+    init: Optional[Tuple[np.ndarray, np.ndarray, float]] = None,
+    seed: int = 42,
+    spatial_key: str = "spatial_manta",
+    expression_key: str | None = None,
+    progress: bool = True,
+):
+    """Rigid alignment of `source` onto `target` that optimises correspondences and transform jointly
+    (alternative to `rigid`, which matches voxels by expression first and filters the matches with RANSAC).
+
+    1. Rotation scan (2D): every angle in `angles` (default 0, 2, ..., 358 deg) and every translation is scored by
+       the FFT cross-correlation of blurred expression images (pixel `scan_pixel_size`, blur `scan_sigma`, in
+       coordinate units; expression reduced to `n_scan_features` axes). Global optimum on that grid; no RANSAC.
+    2. OT refinement (`refine`, any dimension): alternate an unbalanced entropic OT coupling with cost
+       |T(x) - y|^2 / sigma^2 + alpha (1 - cosine(expression)) and a weighted Kabsch fit, sigma annealing over
+       `sigmas`. `rho` sets how strongly every point must be matched (smaller = more partial overlap allowed),
+       `epsilon` the entropic blur of the coupling, `max_points` the subsample size per set.
+
+    `init` = (R, t, s) skips the scan and starts the refinement there (required for 3D).
+    `scan['peak_ratio']` measures how ambiguous the pose is: the best score more than 30 deg away from the chosen
+    angle relative to the chosen one (near 1 = ambiguous; restrict `angles` if a prior on the rotation exists).
+    The result is stored like `rigid`: `source.uns['rigid_alignment']` with R, t, s (x -> s R x + t), aligned_pts,
+    history (one entry per sigma), method='joint' and the scan (angles, scores); `source.obsm['rigid']`.
+    """
+    generator = np.random.default_rng(seed)
+
+    def _expr(adata):
+        X = adata.X if expression_key is None else adata.obsm.get(expression_key)
+        X = X.toarray() if hasattr(X, "toarray") else X
+        return np.asarray(X, dtype=float)
+
+    src_pts = np.asarray(source.obsm.get(spatial_key), dtype=float)
+    tgt_pts = np.asarray(target.obsm.get(spatial_key), dtype=float)
+    src_expr, tgt_expr = _expr(source), _expr(target)
+    d = src_pts.shape[1]
+
+    if angles is None:
+        angles = list(np.arange(0.0, 360.0, 2.0))
+
+    bar = None
+    if progress:
+        bar, _ = _get_progress(steps=2 + (len(sigmas) if refine else 0), desc="Joint Rigid Alignment")
+
+    scan = None
+    if init is None:
+        if d != 2:
+            raise ValueError("rigid_joint: the rotation scan needs 2D coordinates; pass init=(R, t, s) for 3D")
+        fs, ft = _scan_features(src_expr, tgt_expr, n_scan_features, seed=seed)
+        scan = _rotation_scan(src_pts, fs, tgt_pts, ft, angles, pixel_size=scan_pixel_size, sigma=scan_sigma)
+        R, t, s = scan["R"], scan["t"], scan["s"]
+    else:
+        R, t, s = np.asarray(init[0], float), np.asarray(init[1], float), float(init[2])
+    _update_progress(progress=bar, message="Rotation scan" if scan is not None else "Init")
+
+    history: List[Dict[str, Any]] = []
+    if refine:
+        ref = _ot_refine(
+            src_pts, src_expr, tgt_pts, tgt_expr, R, t, s,
+            sigmas=sigmas, alpha=alpha, epsilon=epsilon, rho=rho, n_inner=n_inner,
+            n_sinkhorn_iters=n_sinkhorn_iters, max_points=max_points, allow_scaling=allow_scaling,
+            generator=generator, progress=bar
+        )
+        R, t, s, history = ref["R"], ref["t"], ref["s"], ref["history"]
+
+    aligned_pts = _apply_transform(src_pts, R, t, s)
+    source.obsm["rigid"] = aligned_pts
+    target.obsm["rigid"] = target.obsm.get(spatial_key)
+
+    source.uns["rigid_alignment"] = {
+        "method": "joint",
+        "R": R,
+        "t": t,
+        "s": s,
+        "aligned_pts": aligned_pts,
+        "history": history,
+        "scan": None if scan is None else {
+            "R": scan["R"], "t": scan["t"], "angle": scan["angle"],
+            "angles": scan["angles"], "scores": scan["scores"], "peak_ratio": scan["peak_ratio"]
+        },
+    }
+
+    if bar is not None:
+        _update_progress(progress=bar, message="Finished")
 
 
 def non_rigid(
